@@ -1,0 +1,155 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release Tag (e.g. v0.1.0)'
+        required: false
+        default: 'v0.1.0'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref_name || inputs.tag || 'v0.1.0' }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+          - os: macos-latest
+          - os: ubuntu-22.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            pkg-config \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            xdg-utils
+
+      - name: Install frontend dependencies
+        run: npm install
+
+      - name: Build Tauri App
+        run: npx tauri build
+
+      - name: Prepare Windows Release Assets
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release-assets | Out-Null
+          $TAG = if ($env:GITHUB_REF -like "refs/tags/*") { $env:GITHUB_REF.Replace("refs/tags/", "") } else { "${{ inputs.tag }}" }
+          if (-not $TAG) { $TAG = "v0.1.0" }
+
+          # 1. Copy MSI & Setup installers
+          Get-ChildItem -Path "src-tauri/target/release/bundle" -Recurse -Include *.msi, *setup.exe | ForEach-Object {
+            Copy-Item $_.FullName release-assets/
+            Write-Host "Collected installer: $($_.Name)"
+          }
+
+          # 2. Package portable standalone ZIP
+          $exe = "src-tauri/target/release/cpa-quota-widget.exe"
+          if (Test-Path $exe) {
+            $zipName = "cpa-quota-widget-$TAG-windows-x64-portable.zip"
+            Compress-Archive -Path $exe -DestinationPath (Join-Path release-assets $zipName) -Force
+            Write-Host "Created portable ZIP: $zipName"
+          }
+
+      - name: Prepare macOS Release Assets
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p release-assets
+          TAG="${GITHUB_REF_NAME:-${{ inputs.tag }}}"
+          [ -z "$TAG" ] && TAG="v0.1.0"
+
+          # Copy DMG installers
+          find src-tauri/target/release/bundle/dmg -name "*.dmg" -exec cp {} release-assets/ \; 2>/dev/null || true
+
+          # Zip .app bundle
+          APP_PATH=$(find src-tauri/target/release/bundle/macos -name "*.app" -type d | head -1 || true)
+          if [ -n "$APP_PATH" ]; then
+            APP_NAME=$(basename "$APP_PATH")
+            APP_DIR=$(dirname "$APP_PATH")
+            cd "$APP_DIR"
+            zip -r -q "$GITHUB_WORKSPACE/release-assets/cpa-quota-widget-${TAG}-macOS.zip" "$APP_NAME"
+            cd "$GITHUB_WORKSPACE"
+            echo "Created macOS zip"
+          fi
+
+      - name: Prepare Linux Release Assets
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p release-assets
+
+          # Copy AppImage and deb bundles
+          find src-tauri/target/release/bundle -type f \( -name "*.AppImage" -o -name "*.deb" -o -name "*.rpm" \) -exec cp {} release-assets/ \; 2>/dev/null || true
+
+      - name: List Prepared Assets
+        shell: bash
+        run: |
+          echo "Assets to upload:"
+          ls -la release-assets/
+
+      - name: Upload Release Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ (startsWith(github.ref, 'refs/tags/') && github.ref_name) || inputs.tag || 'v0.1.0' }}
+          name: cpa-quota-widget ${{ (startsWith(github.ref, 'refs/tags/') && github.ref_name) || inputs.tag || 'v0.1.0' }}
+          prerelease: false
+          generate_release_notes: true
+          body: |
+            ### CPA 额度悬浮卡片 (cpa-quota-widget) 发布
+
+            面向 CPA / CLIProxyAPI 的轻量桌面额度卡片小组件。
+
+            #### 功能特性：
+            - **平台额度看板**：支持按平台 Tab 筛选与查看各平台账号额度与重置时间
+            - **忽略禁用凭证**：自动过滤 CPA 中已禁用的凭证，面板不展示、不占统计
+            - **隐私脱敏显示**：标题栏自带眼睛图标，支持一键脱敏打码邮箱、手机号与账号标识，防截屏泄密
+            - **白天/夜间主题**：叠卡 Logo 与系统主题智能同步切换
+            - **迷你悬浮胶囊**：双击展开，同一刻度深浅双层进度条对比
+            - **智能磁吸吸附**：窗口拖动时与桌面屏幕四边、其他活动窗口边缘智能磁吸对齐
+            - **窗口置顶与透明度**：支持悬浮窗口置顶显示与透明度平滑调节
+
+            #### 资源下载指南：
+            - **Windows**:
+              - 安装包：`.msi` 或 `-setup.exe`
+              - 免安装绿色版：`cpa-quota-widget-*-windows-x64-portable.zip`（推荐，解压直接双击运行）
+            - **macOS**:
+              - `.dmg` 安装镜像或 `.zip` 压缩包
+            - **Linux**:
+              - `.AppImage` 便携版或 `.deb` 安装包
+          files: release-assets/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

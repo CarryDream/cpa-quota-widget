@@ -1,0 +1,6 @@
+{
+  "productName": "CPA 额度悬浮卡片",
+  "bundle": {
+    "targets": ["nsis"]
+  }
+}
